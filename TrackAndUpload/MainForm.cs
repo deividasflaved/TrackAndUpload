@@ -1,8 +1,17 @@
-﻿using System;
+﻿using Google.Apis.Auth.OAuth2;
+using Google.Apis.Services;
+using Google.Apis.Util.Store;
+using Google.Apis.YouTube.v3;
+using System;
+using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Reflection;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
+using Google.Apis.Upload;
+using Google.Apis.YouTube.v3.Data;
 
 namespace TrackAndUpload
 {
@@ -21,11 +30,12 @@ namespace TrackAndUpload
         {
             using (var f = new FolderBrowserDialog())
             {
-                if (f.ShowDialog() != DialogResult.OK) 
+                if (f.ShowDialog() != DialogResult.OK)
                     return;
-                
+
                 eTrackedPath.Text = f.SelectedPath;
             }
+
             UpdateControls();
         }
 
@@ -50,12 +60,13 @@ namespace TrackAndUpload
                                            | NotifyFilters.DirectoryName;
 
                     // Only watch text files.
-                    watcher.Filter = "*.txt";
+                    watcher.Filter = "*.mp4";
+                    watcher.IncludeSubdirectories = true;
 
                     // Add event handlers.
                     watcher.Changed += OnChanged;
                     watcher.Created += OnChanged;
-                    watcher.Deleted += OnChanged;
+                    //watcher.Deleted += OnChanged;
                     watcher.Renamed += OnRenamed;
 
                     // Begin watching.
@@ -76,12 +87,16 @@ namespace TrackAndUpload
 
         private void OnRenamed(object sender, RenamedEventArgs e)
         {
-            UpdateLog($"File: {e.OldFullPath} renamed to {e.FullPath}");
+            //UpdateLog($"File: {e.OldFullPath} renamed to {e.FullPath}");
+            if(File.Exists(e.FullPath) && new FileInfo(e.FullPath).Length > 25000000)
+                Run(e.FullPath);
         }
 
         private void OnChanged(object sender, FileSystemEventArgs e)
         {
-            UpdateLog($"File: {e.FullPath} {e.ChangeType}");
+            //UpdateLog($"File: {e.FullPath} {e.ChangeType}");
+            if (File.Exists(e.FullPath) && new FileInfo(e.FullPath).Length > 25000000)
+                Run(e.FullPath);
         }
 
         private void btnStop_Click(object sender, EventArgs e) => _exit = true;
@@ -164,5 +179,68 @@ namespace TrackAndUpload
             WindowState = FormWindowState.Normal;
             notifyIcon.Visible = false;
         }
+
+        private async Task Run(string filePath)
+        {
+            UserCredential credential;
+            using (var stream = new FileStream("..\\..\\..\\client_secrets.json", FileMode.Open, FileAccess.Read))
+            {
+                credential = await GoogleWebAuthorizationBroker.AuthorizeAsync(
+                    GoogleClientSecrets.Load(stream).Secrets,
+                    // This OAuth 2.0 access scope allows an application to upload files to the
+                    // authenticated user's YouTube channel, but doesn't allow other types of access.
+                    new[] { YouTubeService.Scope.YoutubeUpload },
+                    "user",
+                    CancellationToken.None
+                );
+            }
+
+            var youtubeService = new YouTubeService(new BaseClientService.Initializer()
+            {
+                HttpClientInitializer = credential,
+                ApplicationName = Assembly.GetExecutingAssembly().GetName().Name
+            });
+
+            var video = new Video
+            {
+                Snippet = new VideoSnippet
+                {
+                    Title = Path.GetFileName(filePath), Description = ""
+                },
+                Status = new VideoStatus {PrivacyStatus = "unlisted"}
+            };
+            //video.Snippet.Tags = new string[] { "tag1", "tag2" };
+            //video.Snippet.CategoryId = "20"; // See https://developers.google.com/youtube/v3/docs/videoCategories/list
+            // or "private" or "public"
+
+            using (var fileStream = new FileStream(filePath, FileMode.Open))
+            {
+                var videosInsertRequest = youtubeService.Videos.Insert(video, "snippet,status", fileStream, "video/*");
+                videosInsertRequest.ProgressChanged += videosInsertRequest_ProgressChanged;
+                videosInsertRequest.ResponseReceived += videosInsertRequest_ResponseReceived;
+
+                await videosInsertRequest.UploadAsync();
+            }
+        }
+
+        void videosInsertRequest_ProgressChanged(Google.Apis.Upload.IUploadProgress progress)
+        {
+            switch (progress.Status)
+            {
+                case UploadStatus.Uploading:
+                    Debug.WriteLine("{0} bytes sent.", progress.BytesSent);
+                    break;
+
+                case UploadStatus.Failed:
+                    Debug.WriteLine("An error prevented the upload from completing.\n{0}", progress.Exception);
+                    break;
+            }
+        }
+
+        void videosInsertRequest_ResponseReceived(Video video)
+        {
+            UpdateLog($"Video id '{video.Id}' was successfully uploaded.");
+        }
     }
+
 }
